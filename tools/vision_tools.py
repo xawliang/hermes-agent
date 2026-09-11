@@ -642,6 +642,41 @@ def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: floa
             **({"model": model} if model else {})}
 
 
+def _vision_backup_provider() -> Optional[str]:
+    """``auxiliary.vision.backup_provider`` —— 主 vision provider 失败时改用的备用 provider。
+
+    这是该配置的**唯一读取点**。它曾因升级把实现 stash 走而静默失效：
+    配置里写着 ``backup_provider: agnes``，代码里却没人读，主 provider 一失败就直接抛错。
+    改这里时务必确认调用链仍连到实际的重试分支。
+    """
+    try:
+        raw = (_cfg_auxiliary("vision", default={}) or {}).get("backup_provider")
+    except Exception:
+        return None
+    return (str(raw).strip() or None) if raw else None
+
+
+async def _call_backup_vision(call_kwargs: dict, primary_err: Exception):
+    """主 provider 失败后改用 ``backup_provider`` 重试一次。
+
+    未配置后备、或后备也失败时，**抛出原始错误**（``primary_err``）——保留主因，
+    否则排查时只看得到后备的报错，会误判问题所在。
+    """
+    backup = _vision_backup_provider()
+    if not backup:
+        raise primary_err
+    logger.warning(
+        "Primary vision provider failed (%s); trying backup provider '%s'",
+        str(primary_err)[:100], backup)
+    try:
+        response = await async_call_llm(**{**call_kwargs, "provider": backup})
+    except Exception as _backup_err:
+        logger.error("Backup provider '%s' also failed: %s", backup, str(_backup_err)[:200])
+        raise primary_err
+    logger.info("Backup provider '%s' succeeded", backup)
+    return response
+
+
 def _media_messages(user_prompt: str, part_type: str, data_url: str) -> list:
     """Single user message: text + one ``image_url``/``video_url`` data-URL part."""
     return [{"role": "user", "content": [
@@ -783,14 +818,17 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if not (_is_image_size_error(_api_err) and len(image_data_url) > _RESIZE_TARGET_BYTES):
-                raise
-            logger.info(
-                "API rejected image (%.1f MB, likely too large); auto-resizing to ~%.0f MB and retrying...",
-                len(image_data_url) / (1024 * 1024), _RESIZE_TARGET_BYTES / (1024 * 1024))
-            image_data_url = await _resize_prepared(prepared, _scale_info)
-            messages[0]["content"][1]["image_url"]["url"] = image_data_url
-            response = await async_call_llm(**call_kwargs)
+            if _is_image_size_error(_api_err) and len(image_data_url) > _RESIZE_TARGET_BYTES:
+                logger.info(
+                    "API rejected image (%.1f MB, likely too large); auto-resizing to ~%.0f MB and retrying...",
+                    len(image_data_url) / (1024 * 1024), _RESIZE_TARGET_BYTES / (1024 * 1024))
+                image_data_url = await _resize_prepared(prepared, _scale_info)
+                messages[0]["content"][1]["image_url"]["url"] = image_data_url
+                response = await async_call_llm(**call_kwargs)
+            else:
+                # 非尺寸问题（超时/额度/服务不可用等）→ 主 provider 不可用，
+                # 交后备 provider 兜一次；没配后备则原样抛出。
+                response = await _call_backup_vision(call_kwargs, _api_err)
         analysis = await _call_vision_llm(
             call_kwargs, "Vision LLM returned empty content, retrying once", response)
         return analysis, _build_scale_note(_scale_info or None, prepared.crop_offset or None)
