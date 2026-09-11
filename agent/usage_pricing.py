@@ -188,7 +188,10 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     }),
     # deepseek-chat / deepseek-reasoner are deprecated aliases of
     # deepseek-v4-flash's non-thinking / thinking modes — same rates.
-    ("deepseek", "https://api-docs.deepseek.com/quick_start/pricing", "deepseek-pricing-2026-07", {
+    # 2026-09-10: V4.1 Flash (``deepseek-flash``) carries the new Flash rate card,
+    # cut at 12:00 Beijing time — off-peak ¥0.02/¥1/¥4 per 1M cached/uncached-in/out.
+    ("deepseek", "https://api-docs.deepseek.com/quick_start/pricing", "deepseek-pricing-2026-09-10", {
+        "deepseek-flash": ("0.14", "0.56", "0.003"),
         ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"): ("0.14", "0.28", "0.0028"),
         "deepseek-v4-pro": ("0.435", "0.87", "0.003625"),
     }),
