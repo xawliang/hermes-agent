@@ -656,11 +656,41 @@ def _vision_backup_provider() -> Optional[str]:
     return (str(raw).strip() or None) if raw else None
 
 
+def _vision_backup_model(backup: str) -> Optional[str]:
+    """后备 provider 该用哪个模型 —— **不能继承主 provider 的**。
+
+    ``async_call_llm`` 的模型优先级是 ``显式 model > auxiliary.<task>.model``（见
+    auxiliary_client 的 ``resolved_model = model or cfg_model``）。vision 任务的
+    ``auxiliary.vision.model`` 属于**主 provider**（腾讯混元的 hunyuan-*），
+    若后备不显式给 model，它就会拿着混元的模型名去请求 agnes —— 实测 agnes 直接
+    503 model_not_found，后备等于没兜住。而"主 provider 模型不存在/无可用通道"
+    恰恰是最常见的失败原因。
+
+    取值顺序：``auxiliary.vision.backup_model``（显式指定）→
+    ``providers.<backup>.model`` / ``.default_model``（该 provider 自己的默认）。
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        explicit = (_cfg_auxiliary("vision", default={}) or {}).get("backup_model")
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        for key in ("model", "default_model"):
+            m = cfg_get(cfg, "providers", backup, key, default=None)
+            if m and str(m).strip():
+                return str(m).strip()
+    except Exception:
+        return None
+    return None
+
+
 async def _call_backup_vision(call_kwargs: dict, primary_err: Exception):
     """主 provider 失败后改用 ``backup_provider`` 重试一次。
 
     未配置后备、或后备也失败时，**抛出原始错误**（``primary_err``）——保留主因，
-    否则排查时只看得到后备的报错，会误判问题所在。
+    否则排查时只看得见后备的报错，会误判问题所在。
+
+    model 必须换成后备 provider 自己的（见 ``_vision_backup_model``）。
     """
     backup = _vision_backup_provider()
     if not backup:
@@ -668,12 +698,17 @@ async def _call_backup_vision(call_kwargs: dict, primary_err: Exception):
     logger.warning(
         "Primary vision provider failed (%s); trying backup provider '%s'",
         str(primary_err)[:100], backup)
+    backup_kwargs = {k: v for k, v in call_kwargs.items() if k != "model"}
+    backup_kwargs["provider"] = backup
+    backup_model = _vision_backup_model(backup)
+    if backup_model:
+        backup_kwargs["model"] = backup_model
     try:
-        response = await async_call_llm(**{**call_kwargs, "provider": backup})
+        response = await async_call_llm(**backup_kwargs)
     except Exception as _backup_err:
         logger.error("Backup provider '%s' also failed: %s", backup, str(_backup_err)[:200])
         raise primary_err
-    logger.info("Backup provider '%s' succeeded", backup)
+    logger.info("Backup provider '%s' succeeded (model=%s)", backup, backup_model or "<provider default>")
     return response
 
 
